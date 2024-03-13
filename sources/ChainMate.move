@@ -11,14 +11,35 @@ module chainmate::profiles {
     use aptos_token_objects::property_map;
     use aptos_token_objects::token;
     use std::bcs;
+    use std::error;
 
 
     const COLLECTION_NAME: vector<u8> = b"ChainMate";
     const COLLECTION_DESCRIPTION: vector<u8> = b"This is a NFT minted to the user creating a profile on ChainMate";
 
+    //Errors
+    const USER_PROFILE_DOES_NOT_EXIST: u64 = 1;
+    const SWIPED_USER_PROFILE_DOES_NOT_EXIST: u64 = 2;
+    const INVALID_BATCH_UPDATE: u64 = 3;
+
+    struct Match has store{
+        users: vector<address>,
+    }
+
+    struct BatchUpdate has drop {
+        updates: vector<ProfileUpdate>,
+    }
+
+    struct ProfileUpdate has drop, store {
+        user: address,
+        profile_score: u64,
+    }
+
     struct Profile has key {
         id: vector<u8>,
         profile_score: u64,
+        age: u8,
+        bio: String,
     }
     struct GlobalStorage has key{
         next_index: u64,
@@ -36,11 +57,8 @@ module chainmate::profiles {
         base_uri: String,
     }
 
-    fun init_module(sender: &signer) {
-        create_profile_collection(sender);
-    }
+    fun init_module(creator: &signer) {       
 
-    fun init_module(creator: &signer) {        
         // Constructs the strings from the bytes.
         let description = string::utf8(COLLECTION_DESCRIPTION);
         let name = string::utf8(COLLECTION_NAME);
@@ -142,10 +160,58 @@ module chainmate::profiles {
         /// Transfer the profile to the creator
         move_to(creator, Profile{
             id: profile_UID,
-            profile_score: base_score
+            profile_score: base_score,
+            age: 0,
+            bio: string::utf8(b""),
 
         })
 
     }
 
+    public fun create_match(user1: address, user2: address) {
+        let users = vector[user1, user2];
+        let match = Match { users };
+    }
+
+    public entry fun process_batch_update(
+        batch_update: vector<ProfileUpdate>,
+        _witness: &signer,
+    ) acquires Profile {
+        assert!(signer::address_of(_witness) == @chainmate, error::permission_denied(INVALID_BATCH_UPDATE));
+
+        let i = 0;
+        while (i < vector::length(&batch_update)) {
+            let update = vector::borrow(&batch_update, i);
+            let user = update.user;
+            let new_score = update.profile_score;
+
+            assert!(exists<Profile>(user), error::not_found(USER_PROFILE_DOES_NOT_EXIST));
+
+            let profile = borrow_global_mut<Profile>(user);
+            if (new_score >= 0) {
+                profile.profile_score = new_score;
+            } else {
+                profile.profile_score = 0;
+            };
+
+            i = i + 1;
+        };
+    }
+
+    public fun get_sorted_profiles(): vector<Profile> acquires Profile {
+        let profiles = vector::empty<Profile>();
+
+        aptos_framework::account::for_all(|address| {
+            if (exists<Profile>(address)) {
+                let profile = borrow_global<Profile>(address);
+                vector::push_back(&mut profiles, *profile);
+            }
+        });
+
+        vector::sort(&mut profiles, |a, b| {
+            a.profile_score > b.profile_score
+        });
+
+        profiles
+    }
 }
