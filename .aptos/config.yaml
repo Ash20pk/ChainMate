@@ -1,0 +1,8 @@
+---
+profiles:
+  default:
+    private_key: "0x18570d032f94e5103a911140a6974bd6f9ceb024b8addf974f163c98e48709bc"
+    public_key: "0x010a4e576b2bff3019f857761bf5c7e763c71bc7b7a5f73da4d218543677c35d"
+    account: d16e1a31b9f8ef09dcdf8f9b7c792cecff1dc1421e54d773ef010b3be4de7501
+    rest_url: "https://fullnode.random.aptoslabs.com/v1"
+    faucet_url: "https://faucet.random.aptoslabs.com/"

@@ -1,17 +1,20 @@
-module chainmate::profiles {
+module chainmate::chainmate {
 
     use std::vector;    
     use aptos_framework::randomness;  
     use std::signer;
     use std::hash;
     use std::string::{Self, String};
-    use std::option;
+    use std::option::{Self, Option};
     use aptos_framework::object;
     use aptos_token_objects::collection;
     use aptos_token_objects::property_map;
     use aptos_token_objects::token;
     use std::bcs;
     use std::error;
+    use std::table;
+    use aptos_framework::account;
+    use aptos_framework::event::{Self, EventHandle};
 
 
     const COLLECTION_NAME: vector<u8> = b"ChainMate";
@@ -21,28 +24,42 @@ module chainmate::profiles {
     const USER_PROFILE_DOES_NOT_EXIST: u64 = 1;
     const SWIPED_USER_PROFILE_DOES_NOT_EXIST: u64 = 2;
     const INVALID_BATCH_UPDATE: u64 = 3;
+    const EMATCH_NOT_FOUND: u64 = 4;
 
-    struct Match has store{
-        users: vector<address>,
+    struct Match has store, drop{
+        user1: address,
+        user2: address,
     }
 
-    struct BatchUpdate has drop {
-        updates: vector<ProfileUpdate>,
+    struct MatchTable has key {
+        matches: table::Table<u64, Match>,
+        current_match_id: u64,
     }
 
-    struct ProfileUpdate has drop, store {
-        user: address,
-        profile_score: u64,
-    }
-
-    struct Profile has key {
+    struct Profile has key, store, copy {
         id: vector<u8>,
         profile_score: u64,
         age: u8,
         bio: String,
     }
-    struct GlobalStorage has key{
-        next_index: u64,
+
+    struct MatchHandler has key, store{
+        all_matches: table::Table<address, u64>,
+        match_event: EventHandle<MatchEvent>,
+        unmatch_event: EventHandle<UnmatchEvent>,
+    }
+
+    struct ProfileStore has key {
+        profiles: vector<Profile>,
+        current_index_id: u64,
+    }
+
+    struct MatchEvent has drop, store {
+        match_id: u64,
+    }
+
+    struct UnmatchEvent has drop, store {
+        match_id: u64,
     }
 
    /// The Profile token
@@ -63,6 +80,16 @@ module chainmate::profiles {
         let description = string::utf8(COLLECTION_DESCRIPTION);
         let name = string::utf8(COLLECTION_NAME);
         let uri = string::utf8(b"");
+
+        move_to(creator, ProfileStore {
+            profiles: vector::empty<Profile>(),
+            current_index_id: 0
+        });
+
+        move_to(creator, MatchTable{
+            matches: table::new(),
+            current_match_id: 0
+        });
 
         // Creates the collection with unlimited supply and without establishing any royalty configuration.
         collection::create_unlimited_collection(
@@ -144,12 +171,32 @@ module chainmate::profiles {
     }
     
 
-    public fun create_profile(creator: &signer, _token_uri: String, data: &mut GlobalStorage ) {
+    public fun create_profile(creator: &signer, _token_uri: String ) acquires ProfileStore {
+        let profile_store = borrow_global_mut<ProfileStore>(@chainmate);
         let base_score = randomness::u64_range(50, 100);
         let address = signer::address_of(creator);
         let profile_UID: vector<u8> = hash::sha2_256(bcs::to_bytes(&address));
-        let index = data.next_index + 1;
-        data.next_index = index;
+        let index = profile_store.current_index_id + 1;
+
+        let profile = Profile{
+            id: profile_UID,
+            profile_score: base_score,
+            age: 0,
+            bio: string::utf8(b""),
+
+        };
+
+        let match_handler = MatchHandler{
+            all_matches: table::new(),
+            match_event: account::new_event_handle<MatchEvent>(creator),
+            unmatch_event: account::new_event_handle<UnmatchEvent>(creator),
+        };
+
+        // Update the profile store
+        profile_store.current_index_id = index;
+        vector::push_back(&mut profile_store.profiles, copy profile);
+
+        // Mint the profile NFT to the signer
         mint_profile_token(
                 creator,
                 index,
@@ -157,61 +204,105 @@ module chainmate::profiles {
                 signer::address_of(creator),
                 profile_UID,
             );
+
         /// Transfer the profile to the creator
-        move_to(creator, Profile{
-            id: profile_UID,
-            profile_score: base_score,
-            age: 0,
-            bio: string::utf8(b""),
-
-        })
+        move_to(creator, profile);
+        move_to(creator, match_handler);
 
     }
 
-    public fun create_match(user1: address, user2: address) {
-        let users = vector[user1, user2];
-        let match = Match { users };
-    }
+    public fun create_match(user1: address, user2: address) acquires MatchTable, Profile, MatchHandler {
+        assert!(exists<MatchTable>(@chainmate), 2);
 
-    public entry fun process_batch_update(
-        batch_update: vector<ProfileUpdate>,
-        _witness: &signer,
-    ) acquires Profile {
-        assert!(signer::address_of(_witness) == @chainmate, error::permission_denied(INVALID_BATCH_UPDATE));
+        let match_table = borrow_global_mut<MatchTable>(@chainmate);
+        let match_id = match_table.current_match_id + 1;
+        let new_match = Match {
+                user1,
+                user2,
+            };
+        // Add the match to the table
+        table::add(&mut match_table.matches, match_id, new_match);
 
-        let i = 0;
-        while (i < vector::length(&batch_update)) {
-            let update = vector::borrow(&batch_update, i);
-            let user = update.user;
-            let new_score = update.profile_score;
+        // Operations on user1
+        {
+            let user1_profile = borrow_global_mut<Profile>(user1);
+            let user1_matches = borrow_global_mut<MatchHandler>(user1);
 
-            assert!(exists<Profile>(user), error::not_found(USER_PROFILE_DOES_NOT_EXIST));
-
-            let profile = borrow_global_mut<Profile>(user);
-            if (new_score >= 0) {
-                profile.profile_score = new_score;
+            //Update user1's score
+            if (user1_profile.profile_score != 0){
+                user1_profile.profile_score = user1_profile.profile_score - 5;
             } else {
-                profile.profile_score = 0;
+                user1_profile.profile_score = 0
             };
 
-            i = i + 1;
+            // Add the match to user1's profile
+            table::add(&mut user1_matches.all_matches, user2, match_id);
+        };
+
+        // Operations on user2
+        {
+            let user2_profile = borrow_global_mut<Profile>(user2);
+            let user2_matches = borrow_global_mut<MatchHandler>(user2);
+
+            //Update user2's score
+            if (user2_profile.profile_score != 0){
+                user2_profile.profile_score = user2_profile.profile_score - 5;
+            } else {
+                user2_profile.profile_score = 0
+            };
+
+            // Emit the MatchEvent for user2
+            event::emit_event<MatchEvent>(&mut user2_matches.match_event, MatchEvent {
+                match_id,
+            });
+
+            // Add the match to user2's profile
+            table::add(&mut user2_matches.all_matches, user1, match_id);
         };
     }
 
-    public fun get_sorted_profiles(): vector<Profile> acquires Profile {
-        let profiles = vector::empty<Profile>();
+    public fun unmatch(user1: address, user2: address) acquires MatchTable, Profile, MatchHandler {
+        let match_table = borrow_global_mut<MatchTable>(@chainmate);
 
-        aptos_framework::account::for_all(|address| {
-            if (exists<Profile>(address)) {
-                let profile = borrow_global<Profile>(address);
-                vector::push_back(&mut profiles, *profile);
-            }
-        });
+        //User1 operations
+        {
+            let user1_profile = borrow_global_mut<Profile>(user1);
+            let user1_matches = borrow_global_mut<MatchHandler>(user1);
+            let _match_id = table::remove(&mut user1_matches.all_matches, user2);
+            let _match_id = table::remove(&mut match_table.matches, _match_id);
+            user1_profile.profile_score = user1_profile.profile_score + 2;
+        };
 
-        vector::sort(&mut profiles, |a, b| {
-            a.profile_score > b.profile_score
-        });
+        //User2 operations
+        {
+            let user2_profile = borrow_global_mut<Profile>(user2);
+            let user2_matches = borrow_global_mut<MatchHandler>(user2);
+            let _match_id = table::remove(&mut user2_matches.all_matches, user1);
+            event::emit_event<UnmatchEvent>(&mut user2_matches.unmatch_event, UnmatchEvent{ match_id: _match_id});
+            user2_profile.profile_score = user2_profile.profile_score + 2;
 
-        profiles
+        };                
+    }
+
+    public fun left_swipe_score_update(user: address, score: u64) acquires Profile {
+        let profile = borrow_global_mut<Profile>(user);
+
+        if (profile.profile_score > score){
+            profile.profile_score = profile.profile_score - score;
+        } else {
+            profile.profile_score = 0;
+        }
+    }
+
+    public fun right_swipe_score_update(user: address, score: u64) acquires Profile {
+        let profile = borrow_global_mut<Profile>(user);
+
+        profile.profile_score = profile.profile_score + score;
+        
+    }
+
+    public fun get_profiles(): vector<Profile> acquires ProfileStore {
+        let profile_store = borrow_global_mut<ProfileStore>(@chainmate);
+        profile_store.profiles
     }
 }
